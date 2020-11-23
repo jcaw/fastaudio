@@ -3,11 +3,15 @@ import warnings
 import librosa
 import torch
 from fastai.imports import partial, random
+from fastai.vision.augment import RandTransform
+from fastcore.meta import delegates
 from fastcore.transform import Transform
 from fastcore.utils import ifnone
 from torch.nn import functional as F
+from torch import Tensor
 
 from ..core.spectrogram import AudioSpectrogram, AudioTensor
+from ..util import create_region_mask, auto_batch
 from .signal import AudioPadType
 
 
@@ -62,52 +66,93 @@ def _tfm_pad_spectro(sg, width, pad_mode=AudioPadType.Zeros):
         )
 
 
-class MaskFreq(SpectrogramTransform):
-    """Google SpecAugment frequency masking from https://arxiv.org/abs/1904.08779."""
+def mask_along_axis(specgrams, num_masks=1, min_size=1, max_size=10, mask_val=None, axis=2):
+    device = specgrams.device
+    shape = specgrams.size()
+    # TODO: Still need this?
+    dtype = specgrams.dtype
 
-    def __init__(self, num_masks=1, size=20, start=None, val=None):
+    # First create the broadcastable masks. Each spectrogram gets its own set of
+    # masks.
+    #
+    # The masks are created in parallel by adding an extra dimension to the mask
+    # shape, then collapsing it down to combine them.
+    masks = create_region_mask(
+        [num_masks, shape[0], 1, 1, 1], min_size, max_size, shape[axis], device=device
+    ).amax(dim=0)
+
+    # Orient so the axis we're masking comes last
+    specgrams = specgrams.transpose(axis, -1)
+    # Now mask it
+    if mask_val:
+        specgrams.masked_fill_(masks, mask_val)
+    else:
+        # Mask with the channel-wise mean. Note while each channel in a given
+        # spectrogram takes the same mask position, the value is determined
+        # per-channel.
+
+        # Take the mean of the masked area, not the whole spectrogram, so as not
+        # to change the overall mean (although this will affect the standard
+        # deviation).
+        mask_vals = (specgrams.mul(masks).sum((-2, -1))
+                     # This will be broadcast, so we have to manually multiply
+                     # by the size of that dimension.
+                     / (masks.sum((-2, -1)) * specgrams.shape[-2]))
+
+        # Alternate method: whole channel mean. Use `reshape` because it
+        # might not be contiguous.
+        # mask_vals = specgrams.reshape(*specgrams.shape[:2], -1).mean(-1)
+
+        # TODO: Can this be done inplace?
+        specgrams = torch.where(masks, mask_vals[..., None, None], specgrams)
+        # TODO: This can't broadcast the values, unfortunately.
+        # specgrams.masked_scatter_(combined_masks, mask_vals[..., None, None])
+    # Restore original orientation
+    return specgrams.transpose(axis, -1)
+
+
+class _MaskAxis(RandTransform):
+    """Base class for SpecAugment masking transforms."""
+    def __init__(self, axis, num_masks=1, min_size=1, max_size=10, mask_val=None, batch=False):
+        if axis not in [2, 3]:
+            raise ValueError("Can only mask the time or frequency axis (2 or 3)")
         self.num_masks = num_masks
-        self.size = size
-        self.start = start
-        self.val = val
+        self.min_size  = min_size
+        self.max_size  = max_size
+        self.mask_val  = mask_val
+        self.axis      = axis
+        self.batch     = batch
+        super().__init__()
 
-    def encodes(self, sg: AudioSpectrogram) -> AudioSpectrogram:
-        channel_mean = sg.contiguous().view(sg.size(0), -1).mean(-1)[:, None, None]
-        mask_val = ifnone(self.val, channel_mean)
-        c, y, x = sg.shape
-        # Position of the first mask
-        start = ifnone(self.start, random.randint(0, y - self.size))
-        for _ in range(self.num_masks):
-            mask = torch.ones(self.size, x) * mask_val
-            if not 0 <= start <= y - self.size:
-                raise ValueError(
-                    f"Start value '{start}' out of range for AudioSpectrogram of shape {sg.shape}"
-                )
-            sg[:, start : start + self.size, :] = mask
-            # Setting start position for next mask
-            start = random.randint(0, y - self.size)
-        return sg
+    @auto_batch(3)
+    def encodes(self, sg: AudioSpectrogram):
+        return mask_along_axis(sg, num_masks=self.num_masks,
+                               min_size=self.min_size, max_size=self.max_size,
+                               mask_val=self.mask_val, axis=self.axis)
 
 
-class MaskTime(SpectrogramTransform):
-    """Google SpecAugment time masking from https://arxiv.org/abs/1904.08779."""
+@delegates(_MaskAxis)
+class MaskFreq(_MaskAxis):
+    """Google SpecAugment frequency masking from https://arxiv.org/abs/1904.08779.
 
-    def __init__(self, num_masks=1, size=20, start=None, val=None):
-        self.num_masks = num_masks
-        self.size = size
-        self.start = start
-        self.val = val
+    This version runs on batches and can be run efficiently on the GPU.
 
-    def encodes(self, sg: AudioSpectrogram) -> AudioSpectrogram:
-        sg.data = torch.einsum("...ij->...ji", sg)
-        sg.data = MaskFreq(
-            self.num_masks,
-            self.size,
-            self.start,
-            self.val,
-        )(sg)
-        sg.data = torch.einsum("...ij->...ji", sg)
-        return sg
+    """
+    # TODO: How to delegate the kwargs
+    def __init__(self, **kwargs):
+        super().__init__(axis=2, **kwargs)
+
+
+@delegates(_MaskAxis)
+class MaskTime(_MaskAxis):
+    """Google SpecAugment time masking from https://arxiv.org/abs/1904.08779.
+
+    This version runs on batches and can be run efficiently on the GPU.
+
+    """
+    # TODO: How to delegate the kwargs
+    def __init__(self, **kwargs):
+        super().__init__(axis=3, **kwargs)
 
 
 class SGRoll(SpectrogramTransform):

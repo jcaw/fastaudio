@@ -1,10 +1,12 @@
 from enum import Enum
 
-import colorednoise as cn
 import torch
+import torch.fft
 from fastai.imports import np, random
 from fastai.vision.augment import RandTransform
 from fastcore.transform import Transform
+
+from fastaudio.util import colored_noise, create_region_mask, auto_batch
 
 from ..core.signal import AudioTensor
 from ..core.spectrogram import AudioSpectrogram
@@ -127,25 +129,39 @@ class NoiseColor:
     Brown = 2
 
 
-class AddNoise(Transform):
+class AddNoise(RandTransform):
     "Adds noise of specified color and level to the audio signal"
 
-    def __init__(self, noise_level=0.05, color=NoiseColor.White):
-        self.noise_level = noise_level
-        self.color = color
+    def __init__(self, p=1., min_level=0.0, max_level=0.05, color=NoiseColor.White):
+        self.min_level = min_level
+        self.max_level = max_level
+        self.color     = color
         if color not in [*range(-2, 3)]:
             raise ValueError(f"color {color} is not valid")
+        super().__init__(p=p)
 
+    def before_call(self, b, split_idx):
+        self.do = True
+
+    @auto_batch(2)
     def encodes(self, ai: AudioTensor) -> AudioTensor:
-        # if it's white noise, implement our own for speed
+        n = ai.shape[0]
+
         if self.color == NoiseColor.White:
+            # if it's white noise, implement our own for speed
             noise = torch.randn_like(ai.data)
         else:
-            noise = torch.from_numpy(
-                cn.powerlaw_psd_gaussian(exponent=self.color, size=ai.nsamples)
-            ).float()
-        scaled_noise = noise * ai.data.abs().mean() * self.noise_level
-        ai.data += scaled_noise
+            noise = colored_noise(ai.shape, exponent=self.color, device=ai.device)
+
+        # Noise is *not* calcualted per-channel, but per-item.
+        noise *= (ai.abs().mean((-2, -1))
+                  # Scales
+                  * (torch.randn([n], device=ai.device)
+                     * (self.max_level - self.min_level) + self.min_level)
+                  # Mask
+                  * (torch.randn([n], device=ai.device) <= self.p)
+                 )[..., None, None]
+        ai.data += noise
         return ai
 
 
@@ -154,14 +170,25 @@ class ChangeVolume(RandTransform):
 
     def __init__(self, p=0.5, lower=0.5, upper=1.5):
         self.lower, self.upper = lower, upper
+        self._rand_mult = upper - lower
         super().__init__(p=p)
 
     def before_call(self, b, split_idx):
-        super().before_call(b, split_idx)
-        self.gain = random.uniform(self.lower, self.upper)
+        self.do = True
 
-    def encodes(self, ai: AudioTensor):
-        return ai.apply_gain(self.gain)
+    @auto_batch(2)
+    def encodes(self, ai: AudioTensor) -> AudioTensor:
+        op_shape = [ai.size(0)]
+        scales = torch.where(
+            # Mask
+            torch.rand(op_shape, device=ai.device) <= self.p,
+            # Modifier
+            torch.rand(op_shape, device=ai.device) * self._rand_mult + self.lower,
+            # No modification
+            torch.ones(op_shape, device=ai.device),
+        )
+        ai *= scales[:, None, None]
+        return ai
 
 
 class SignalCutout(RandTransform):
@@ -172,26 +199,44 @@ class SignalCutout(RandTransform):
         super().__init__(p=p)
 
     def before_call(self, b, split_idx):
-        super().before_call(b, split_idx)
-        self.cut_pct = random.uniform(0, self.max_cut_pct)
+        self.do = True
 
+    @auto_batch(2)
     def encodes(self, ai: AudioTensor):
-        return ai.cutout(self.cut_pct)
+        n, c, s = ai.shape
+
+        mask = create_region_mask([n, 1, 1], 0, (s * self.max_cut_pct), s, device=ai.device)
+        # Only apply mask to a random subset of items
+        mask *= torch.rand([n, 1, 1], device=ai.device) <= self.p
+        ai.masked_fill_(mask, 0)
+
+        return ai
 
 
 class SignalLoss(RandTransform):
-    "Randomly loses some portion of the signal"
+    "Randomly loses some portion of samples"
 
-    def __init__(self, p=0.5, max_loss_pct=0.15):
-        self.max_loss_pct = max_loss_pct
+    def __init__(self, p=0.5, max_cut_pct=0.15):
+        self.max_cut_pct = max_cut_pct
         super().__init__(p=p)
 
     def before_call(self, b, split_idx):
-        super().before_call(b, split_idx)
-        self.loss_pct = random.uniform(0, self.max_loss_pct)
+        self.do = True
 
+    @auto_batch(2)
     def encodes(self, ai: AudioTensor):
-        return ai.lose_signal(self.loss_pct)
+        n, c, s = ai.shape
+
+        # TODO: Lose the same points across channels?
+        cut_pcts = torch.rand([n, 1, 1], device=ai.device) * self.max_cut_pct
+        masks = torch.rand([n, c, s], device=ai.device) <= cut_pcts
+
+        # Only use a certain proportion of the masks
+        masks *= torch.rand([n, 1, 1], device=ai.device) <= self.p
+
+        ai.masked_fill_(masks, 0)
+
+        return ai
 
 
 # downmixMono was removed from torchaudio, we now just take the mean across channels

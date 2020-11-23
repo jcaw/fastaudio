@@ -212,13 +212,14 @@ def test_noise_fail_bad_color(audio):
 
 
 def test_noise_white(audio):
-    addnoise = AddNoise(color=NoiseColor.White)
+    addnoise = AddNoise(color=NoiseColor.White, p=1., min_level=0.1, max_level=0.2)
     inp, out = apply_transform(addnoise, audio)
     _test_ne(inp.data, out.data)
 
 
 def test_noise_non_white(audio):
-    addnoise = AddNoise(color=NoiseColor.Pink)
+    # White noise uses a different method to other noises, so test both.
+    addnoise = AddNoise(color=NoiseColor.Pink, p=1., min_level=0.1, max_level=0.2)
     inp, out = apply_transform(addnoise, audio)
     _test_ne(inp.data, out.data)
 
